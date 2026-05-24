@@ -237,7 +237,14 @@ export class FedarishaPakService {
         const raw = inbound?.settings?.storage;
         if (!raw) return null;
 
-        const kind: ProviderKind = this.resolveProviderKind(raw.type);
+        const kind = this.resolveProviderKind(raw.type);
+        if (!kind) {
+            this.logger.error(
+                `inbound ${inboundTag}: storage.type must be explicitly set to one of ` +
+                    `"vkcloud-pak" | "selectel-iam" | "static" (got ${JSON.stringify(raw.type)})`,
+            );
+            return null;
+        }
 
         switch (kind) {
             case 'selectel-iam': {
@@ -248,17 +255,16 @@ export class FedarishaPakService {
                 const staticStorage = this.buildStaticStorage(raw);
                 return staticStorage ? { kind, static: staticStorage } : null;
             }
-            default: {
+            case 'vkcloud-pak': {
                 const vkcloud = this.buildVkCloudStorage(raw);
                 return vkcloud ? { kind, vkcloud } : null;
             }
         }
     }
 
-    private resolveProviderKind(type: string | undefined): ProviderKind {
-        if (type === 'selectel-iam') return 'selectel-iam';
-        if (type === 'static') return 'static';
-        return 'vkcloud-pak';
+    private resolveProviderKind(type: string | undefined): ProviderKind | null {
+        if (type === 'vkcloud-pak' || type === 'selectel-iam' || type === 'static') return type;
+        return null;
     }
 
     private buildVkCloudStorage(raw: IRawStorageSettings): IPakStorage | null {
