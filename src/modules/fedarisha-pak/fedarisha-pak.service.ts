@@ -11,10 +11,11 @@ import {
 
 import { IPakStorage, PakService, PakUserAlreadyExistsError } from './pak.service';
 import { ISelectelPakStorage, SelectelPakService } from './selectel-pak.service';
+import { IStaticPakStorage, StaticPakService } from './static-pak.service';
 import { PakProviderConflictError } from './pak-provider.interface';
 import { InternalService } from '../internal/internal.service';
 
-type ProviderKind = 'vkcloud-pak' | 'selectel-iam';
+type ProviderKind = 'vkcloud-pak' | 'selectel-iam' | 'static';
 
 interface IRawStorageSettings {
     type?: string;
@@ -24,6 +25,7 @@ interface IRawStorageSettings {
     prefix?: string;
     accessKey?: string;
     secretKey?: string;
+    pathStyle?: boolean;
     iam?: {
         accountId?: string;
         projectName?: string;
@@ -49,6 +51,7 @@ interface IResolvedStorage {
     kind: ProviderKind;
     vkcloud?: IPakStorage;
     selectel?: ISelectelPakStorage;
+    static?: IStaticPakStorage;
 }
 
 @Injectable()
@@ -59,6 +62,7 @@ export class FedarishaPakService {
         private readonly internalService: InternalService,
         private readonly pakService: PakService,
         private readonly selectelPakService: SelectelPakService,
+        private readonly staticPakService: StaticPakService,
     ) {}
 
     public async provisionUser(
@@ -160,10 +164,14 @@ export class FedarishaPakService {
     }
 
     private async dispatchCreate(storage: IResolvedStorage, userName: string, prefix: string) {
-        if (storage.kind === 'selectel-iam') {
-            return this.selectelPakService.createKey(storage.selectel!, userName, prefix);
+        switch (storage.kind) {
+            case 'selectel-iam':
+                return this.selectelPakService.createKey(storage.selectel!, userName, prefix);
+            case 'static':
+                return this.staticPakService.createKey(storage.static!, userName, prefix);
+            default:
+                return this.pakService.createKey(storage.vkcloud!, userName, prefix);
         }
-        return this.pakService.createKey(storage.vkcloud!, userName, prefix);
     }
 
     private async dispatchDelete(
@@ -171,11 +179,16 @@ export class FedarishaPakService {
         userName: string,
         prefix: string,
     ): Promise<void> {
-        if (storage.kind === 'selectel-iam') {
-            await this.selectelPakService.deleteKey(storage.selectel!, userName, prefix);
-            return;
+        switch (storage.kind) {
+            case 'selectel-iam':
+                await this.selectelPakService.deleteKey(storage.selectel!, userName, prefix);
+                return;
+            case 'static':
+                await this.staticPakService.deleteKey();
+                return;
+            default:
+                await this.pakService.deleteKey(storage.vkcloud!, userName, prefix);
         }
-        await this.pakService.deleteKey(storage.vkcloud!, userName, prefix);
     }
 
     private async dispatchProbe(
@@ -184,15 +197,24 @@ export class FedarishaPakService {
         secretKey: string,
         prefix: string,
     ): Promise<boolean> {
-        if (storage.kind === 'selectel-iam') {
-            return this.selectelPakService.probeKey(
-                storage.selectel!,
-                accessKey,
-                secretKey,
-                prefix,
-            );
+        switch (storage.kind) {
+            case 'selectel-iam':
+                return this.selectelPakService.probeKey(
+                    storage.selectel!,
+                    accessKey,
+                    secretKey,
+                    prefix,
+                );
+            case 'static':
+                return this.staticPakService.probeKey(
+                    storage.static!,
+                    accessKey,
+                    secretKey,
+                    prefix,
+                );
+            default:
+                return this.pakService.probeKey(storage.vkcloud!, accessKey, secretKey, prefix);
         }
-        return this.pakService.probeKey(storage.vkcloud!, accessKey, secretKey, prefix);
     }
 
     // VK Cloud PAK usernames live in a per-master-account namespace, not per
@@ -215,17 +237,28 @@ export class FedarishaPakService {
         const raw = inbound?.settings?.storage;
         if (!raw) return null;
 
-        const kind: ProviderKind = raw.type === 'selectel-iam' ? 'selectel-iam' : 'vkcloud-pak';
+        const kind: ProviderKind = this.resolveProviderKind(raw.type);
 
-        if (kind === 'selectel-iam') {
-            const selectel = this.buildSelectelStorage(raw);
-            if (!selectel) return null;
-            return { kind, selectel };
+        switch (kind) {
+            case 'selectel-iam': {
+                const selectel = this.buildSelectelStorage(raw);
+                return selectel ? { kind, selectel } : null;
+            }
+            case 'static': {
+                const staticStorage = this.buildStaticStorage(raw);
+                return staticStorage ? { kind, static: staticStorage } : null;
+            }
+            default: {
+                const vkcloud = this.buildVkCloudStorage(raw);
+                return vkcloud ? { kind, vkcloud } : null;
+            }
         }
+    }
 
-        const vkcloud = this.buildVkCloudStorage(raw);
-        if (!vkcloud) return null;
-        return { kind, vkcloud };
+    private resolveProviderKind(type: string | undefined): ProviderKind {
+        if (type === 'selectel-iam') return 'selectel-iam';
+        if (type === 'static') return 'static';
+        return 'vkcloud-pak';
     }
 
     private buildVkCloudStorage(raw: IRawStorageSettings): IPakStorage | null {
@@ -236,6 +269,18 @@ export class FedarishaPakService {
             region: raw.region ?? '',
             accessKey: raw.accessKey,
             secretKey: raw.secretKey,
+        };
+    }
+
+    private buildStaticStorage(raw: IRawStorageSettings): IStaticPakStorage | null {
+        if (!raw.bucket || !raw.endpoint || !raw.accessKey || !raw.secretKey) return null;
+        return {
+            bucket: raw.bucket,
+            endpoint: raw.endpoint,
+            region: raw.region ?? '',
+            accessKey: raw.accessKey,
+            secretKey: raw.secretKey,
+            pathStyle: raw.pathStyle,
         };
     }
 
