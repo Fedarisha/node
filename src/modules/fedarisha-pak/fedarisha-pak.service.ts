@@ -19,6 +19,7 @@ type ProviderKind = 'vkcloud-pak' | 'selectel-iam' | 'static';
 
 interface IRawStorageSettings {
     type?: string;
+    authType?: string;
     bucket?: string;
     endpoint?: string;
     region?: string;
@@ -237,11 +238,11 @@ export class FedarishaPakService {
         const raw = inbound?.settings?.storage;
         if (!raw) return null;
 
-        const kind = this.resolveProviderKind(raw.type);
+        const kind = this.resolveProviderKind(raw.authType);
         if (!kind) {
             this.logger.error(
-                `inbound ${inboundTag}: storage.type must be explicitly set to one of ` +
-                    `"vkcloud-pak" | "selectel-iam" | "static" (got ${JSON.stringify(raw.type)})`,
+                `inbound ${inboundTag}: storage.authType must be explicitly set to one of ` +
+                    `"vkcloud-pak" | "selectel-iam" | "static" (got ${JSON.stringify(raw.authType)})`,
             );
             return null;
         }
@@ -262,8 +263,10 @@ export class FedarishaPakService {
         }
     }
 
-    private resolveProviderKind(type: string | undefined): ProviderKind | null {
-        if (type === 'vkcloud-pak' || type === 'selectel-iam' || type === 'static') return type;
+    private resolveProviderKind(authType: string | undefined): ProviderKind | null {
+        if (authType === 'vkcloud-pak' || authType === 'selectel-iam' || authType === 'static') {
+            return authType;
+        }
         return null;
     }
 

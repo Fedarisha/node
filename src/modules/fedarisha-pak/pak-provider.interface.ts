@@ -16,7 +16,7 @@ export interface IPakEndpoint {
 // Shape every PAK provider implements. `storage` is intentionally `unknown`
 // at the interface level — each provider casts it to its own typed config.
 // This keeps the dispatcher (`FedarishaPakService`) free of provider-
-// specific knowledge beyond the discriminator `storage.type`.
+// specific knowledge beyond the discriminator `storage.authType`.
 export interface IPakProvider {
     readonly type: string;
 
