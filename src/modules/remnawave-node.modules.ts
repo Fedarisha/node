@@ -2,6 +2,7 @@ import { Logger, Module, OnApplicationShutdown } from '@nestjs/common';
 
 import { NetworkStatsModule } from './network-stats/network-stats.module';
 import { FedarishaPakModule } from './fedarisha-pak/fedarisha-pak.module';
+import { AsnLmdbModule } from './asn-lmdb/asn-lmdb.module';
 import { HandlerModule } from './handler/handler.module';
 import { PluginModule } from './_plugin/plugin.module';
 import { XrayModule } from './xray-core/xray.module';
@@ -9,6 +10,7 @@ import { StatsModule } from './stats/stats.module';
 
 @Module({
     imports: [
+        AsnLmdbModule,
         NetworkStatsModule,
         PluginModule,
         StatsModule,

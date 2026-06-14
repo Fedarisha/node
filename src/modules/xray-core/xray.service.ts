@@ -1,7 +1,7 @@
 import { ProcessInfo } from '@kastov/node-supervisord/dist/interfaces';
 import { SupervisordClient } from '@kastov/node-supervisord';
-import { readPackageJSON } from 'pkg-types';
-import { table } from 'table';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import ems from 'enhanced-ms';
 import pRetry from 'p-retry';
 import semver from 'semver';
@@ -17,8 +17,8 @@ import { XtlsApi } from '@remnawave/xtls-sdk';
 import { getSystemInfo, getSystemStats } from '@common/utils/get-system-stats';
 import { ICommandResponse } from '@common/types/command-response.type';
 import { generateApiConfig } from '@common/utils/generate-api-config';
-import { KNOWN_ERRORS, REMNAWAVE_NODE_KNOWN_ERROR } from '@libs/contracts/constants';
 import { StartXrayCommand } from '@libs/contracts/commands';
+import { KNOWN_ERRORS } from '@libs/contracts/constants';
 
 import {
     GetNodeHealthCheckResponseModel,
@@ -31,6 +31,7 @@ import { GetTorrentBlockerStateQuery } from '../_plugin/queries/get-torrent-bloc
 import { InternalService } from '../internal/internal.service';
 
 const XRAY_PROCESS_NAME = 'xray' as const;
+const execFileAsync = promisify(execFile);
 
 @Injectable()
 export class XrayService implements OnApplicationBootstrap {
@@ -39,6 +40,7 @@ export class XrayService implements OnApplicationBootstrap {
     private readonly internal: {
         socketPath: string;
         token: string;
+        xtlsApiSocketPath: string;
     };
 
     private readonly xrayPath: string;
@@ -58,6 +60,7 @@ export class XrayService implements OnApplicationBootstrap {
         this.internal = {
             socketPath: this.configService.getOrThrow<string>('INTERNAL_SOCKET_PATH'),
             token: this.configService.getOrThrow<string>('INTERNAL_REST_TOKEN'),
+            xtlsApiSocketPath: this.configService.getOrThrow<string>('XTLS_API_SOCKET_PATH'),
         };
 
         this.xrayPath = '/usr/local/bin/xray';
@@ -71,10 +74,8 @@ export class XrayService implements OnApplicationBootstrap {
 
     async onApplicationBootstrap() {
         try {
-            const pkg = await readPackageJSON();
-
             this.xrayVersion = this.getXrayVersionFromEnv();
-            this.nodeVersion = pkg.version ?? '0.0.0';
+            this.nodeVersion = __RWNODE_VERSION__ ?? '0.0.0';
 
             await this.supervisordApi.getState();
         } catch (error: unknown) {
@@ -96,7 +97,6 @@ export class XrayService implements OnApplicationBootstrap {
 
     public async startXray(
         body: StartXrayCommand.Request,
-        ip: string,
     ): Promise<ICommandResponse<StartXrayResponseModel>> {
         const interfaceStats = await this.queryBus.execute(new GetInterfaceStatsQuery());
         const tm = performance.now();
@@ -175,11 +175,13 @@ export class XrayService implements OnApplicationBootstrap {
 
             if (xrayProcess.error) {
                 if (xrayProcess.error.includes('XML-RPC fault: SPAWN_ERROR: xray')) {
-                    this.logger.error(REMNAWAVE_NODE_KNOWN_ERROR, {
+                    this.logger.error(`Xray Core v${this.xrayVersion} failed to start.`, {
                         timestamp: new Date().toISOString(),
                         rawError: xrayProcess.error,
                         ...KNOWN_ERRORS.XRAY_FAILED_TO_START,
                     });
+
+                    await this.dumpTailBlock('/var/log/supervisor/xray.out.log', 5);
                 } else {
                     this.logger.error(xrayProcess.error);
                 }
@@ -190,39 +192,19 @@ export class XrayService implements OnApplicationBootstrap {
                         false,
                         null,
                         xrayProcess.error,
-                        {
-                            version: this.nodeVersion,
-                        },
+                        { version: this.nodeVersion },
                         system,
                     ),
                 };
             }
 
-            let isStarted = await this.getXrayInternalStatus();
-
-            if (!isStarted && xrayProcess.processInfo!.state === 20) {
-                isStarted = await this.getXrayInternalStatus();
-            }
+            const isStarted = await this.getXrayInternalStatus();
 
             if (!isStarted) {
                 this.isXrayOnline = false;
 
                 this.logger.error(
-                    '\n' +
-                        table(
-                            [
-                                ['Version', this.xrayVersion],
-                                ['Master IP', ip],
-                                ['Internal Status', isStarted],
-                                ['Error', xrayProcess.error],
-                            ],
-                            {
-                                header: {
-                                    content: 'Xray failed to start',
-                                    alignment: 'center',
-                                },
-                            },
-                        ),
+                    `Xray Core v${this.xrayVersion} failed to start. Error: ${xrayProcess.error}`,
                 );
 
                 return {
@@ -241,21 +223,7 @@ export class XrayService implements OnApplicationBootstrap {
 
             this.isXrayOnline = true;
 
-            this.logger.log(
-                '\n' +
-                    table(
-                        [
-                            ['Version', this.xrayVersion],
-                            ['Master IP', ip],
-                        ],
-                        {
-                            header: {
-                                content: 'Xray started',
-                                alignment: 'center',
-                            },
-                        },
-                    ),
-            );
+            this.logger.log(`✔ XRay Core v${this.xrayVersion} is up and running.`);
 
             return {
                 isOk: true,
@@ -395,24 +363,30 @@ export class XrayService implements OnApplicationBootstrap {
     }
 
     private async getXrayInternalStatus(): Promise<boolean> {
+        const tm = performance.now();
         try {
             return await pRetry(
                 async () => {
                     const { isOk, message } = await this.xtlsSdk.stats.getSysStats();
-
                     if (!isOk) {
                         throw new Error(message);
                     }
-
                     return true;
                 },
                 {
-                    retries: 10,
-                    minTimeout: 2000,
+                    retries: 30,
+                    minTimeout: 100,
                     maxTimeout: 2000,
-                    onFailedAttempt: (error) => {
-                        this.logger.debug(
-                            `Get Xray internal status attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`,
+                    factor: 1.5,
+                    onFailedAttempt: (context) => {
+                        this.logger.warn(
+                            `▸ XRay Core status check, ${context.attemptNumber}/${context.attemptNumber + context.retriesLeft} · elapsed ${ems(
+                                performance.now() - tm,
+                                {
+                                    extends: 'short',
+                                    includeMs: true,
+                                },
+                            )} · retrying in ${context.retryDelay}ms`,
                         );
                     },
                 },
@@ -447,5 +421,27 @@ export class XrayService implements OnApplicationBootstrap {
                 error: error instanceof Error ? error.message : 'Unknown error',
             };
         }
+    }
+
+    public async tailLogLines(path: string, n = 10): Promise<string[]> {
+        try {
+            const { stdout } = await execFileAsync('tail', ['-n', String(n), path]);
+            return stdout.split('\n').filter(Boolean);
+        } catch {
+            return [];
+        }
+    }
+
+    private async dumpTailBlock(path: string, lines: number): Promise<void> {
+        const tail = await this.tailLogLines(path, lines);
+        if (tail.length === 0) return;
+
+        this.logger.error(
+            [
+                'Xray Core Log Tail',
+                `${'─'.repeat(8)} ${path} (${tail.length} lines) ${'─'.repeat(8)}`,
+                ...tail.map((l) => `│ ${l}`),
+            ].join('\n'),
+        );
     }
 }

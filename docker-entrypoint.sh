@@ -16,9 +16,11 @@ SUPERVISORD_USER=$(generate_random 64)
 SUPERVISORD_PASSWORD=$(generate_random 64)
 INTERNAL_REST_TOKEN=$(generate_random 64)
 
-INTERNAL_SOCKET_PATH=/run/remnawave-internal-${RNDSTR}.sock
+
 SUPERVISORD_SOCKET_PATH=/run/supervisord-${RNDSTR}.sock
 SUPERVISORD_PID_PATH=/run/supervisord-${RNDSTR}.pid
+XTLS_API_SOCKET_PATH=xtls-api-${RNDSTR}
+INTERNAL_SOCKET_PATH=rwint-${RNDSTR}
 
 export SUPERVISORD_USER
 export SUPERVISORD_PASSWORD
@@ -26,6 +28,7 @@ export INTERNAL_REST_TOKEN
 export INTERNAL_SOCKET_PATH
 export SUPERVISORD_SOCKET_PATH
 export SUPERVISORD_PID_PATH
+export XTLS_API_SOCKET_PATH
 
 echo "[Entrypoint] Getting Supervisord version..."
 echo "[Entrypoint] Supervisord version: $(supervisord --version | head -n 1)"
@@ -53,9 +56,6 @@ XRAY_CORE_VERSION=$(/usr/local/bin/rw-core version | head -n 1)
 export XRAY_CORE_VERSION
 
 echo "[Entrypoint] Xray version: $XRAY_CORE_VERSION"
-echo "[Ports] XTLS_API_PORT: $XTLS_API_PORT"
-
-
 
 echo "[Entrypoint] Executing command: $@"
 exec "$@"
