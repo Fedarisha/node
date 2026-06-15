@@ -2,7 +2,7 @@ ARG XRAY_IMAGE=ghcr.io/fedarisha/xray-core:latest
 
 FROM ${XRAY_IMAGE} AS xray-source
 
-FROM node:24.15-alpine AS build
+FROM node:24.16-alpine AS build
 
 WORKDIR /opt/app
 
@@ -26,7 +26,7 @@ RUN apk add --no-cache curl \
     && rm -f /tmp/asn-prefixes-lmdb.tar.gz
 
 
-FROM node:24.15-alpine
+FROM node:24.16-alpine
 
 LABEL org.opencontainers.image.title="Fedarisha Node"
 LABEL org.opencontainers.image.description="Remnawave Node with Fedarisha-enabled Xray Core"
