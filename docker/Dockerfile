@@ -21,7 +21,7 @@ RUN npm run build \
 FROM alpine:3.21 AS xray
 
 ARG TARGETARCH
-ARG XRAY_VERSION=v26.9.9-1.0.0fed
+ARG XRAY_VERSION=v26.9.9-1.0.1fed
 
 RUN apk add --no-cache curl unzip ca-certificates \
     && case "$TARGETARCH" in \
