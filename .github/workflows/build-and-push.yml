@@ -82,9 +82,9 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             tags+=(-t ghcr.io/fedarisha/node:latest)
           fi
-          docker buildx imagetools create "${tags[$]}" $(
+          docker buildx imagetools create "${tags[@]}" $(
             for digest in *; do
-              printf 'ghcr.io/fedarisha/node$sha256:%s ' "$digest"
+              printf 'ghcr.io/fedarisha/node@sha256:%s ' "$digest"
             done
           )
       - name: Login to Docker Hub
@@ -100,7 +100,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             tags+=(-t voltara13/node:latest)
           fi
-          docker buildx imagetools create "${tags[$]}" "ghcr.io/fedarisha/node:$GITHUB_REF_NAME"
+          docker buildx imagetools create "${tags[@]}" "ghcr.io/fedarisha/node:$GITHUB_REF_NAME"
       - name: Create GitHub release
         if: github.ref_type == 'tag'
         env:
