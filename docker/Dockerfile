@@ -1,7 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-ARG XRAY_IMAGE=ghcr.io/fedarisha/xray-core:latest
-
 FROM node:24.20-trixie-slim AS build
 
 WORKDIR /opt/app
@@ -20,7 +18,23 @@ RUN npm run build \
     && chmod +x dist/cli.js
 
 
-FROM ${XRAY_IMAGE} AS xray
+FROM alpine:3.21 AS xray
+
+ARG TARGETARCH
+ARG XRAY_VERSION=v26.5.9-fed.2
+
+RUN apk add --no-cache curl unzip ca-certificates \
+    && case "$TARGETARCH" in \
+        amd64) XRAY_ARCH=64 ;; \
+        arm64) XRAY_ARCH=arm64-v8a ;; \
+        *) exit 1 ;; \
+    esac \
+    && curl -fL "https://github.com/Fedarisha/Xray-core-fedarisha/releases/download/${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip" -o /tmp/xray.zip \
+    && unzip -j /tmp/xray.zip xray -d /usr/local/bin \
+    && chmod 755 /usr/local/bin/xray \
+    && mkdir -p /usr/local/share/xray \
+    && curl -fL https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat -o /usr/local/share/xray/geoip.dat \
+    && curl -fL https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geosite.dat -o /usr/local/share/xray/geosite.dat
 
 
 FROM alpine:3.21 AS asn

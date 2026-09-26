@@ -28,7 +28,6 @@ target "node" {
 
     args = {
         INTEGRATIONS = VARIANTS[variant].integrations
-        XRAY_IMAGE = "ghcr.io/fedarisha/xray-core:latest"
     }
 
     tags = [
