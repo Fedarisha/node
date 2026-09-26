@@ -1,15 +1,18 @@
 import { Logger, Module, OnApplicationShutdown } from '@nestjs/common';
 
-import { NetworkStatsModule } from './network-stats/network-stats.module';
-import { FedarishaPakModule } from './fedarisha-pak/fedarisha-pak.module';
-import { AsnLmdbModule } from './asn-lmdb/asn-lmdb.module';
-import { HandlerModule } from './handler/handler.module';
+import { IntegrationsModule } from '@integration-modules/integrations.module';
+
 import { PluginModule } from './_plugin/plugin.module';
-import { XrayModule } from './xray-core/xray.module';
+import { AsnLmdbModule } from './asn-lmdb/asn-lmdb.module';
+import { FedarishaPakModule } from './fedarisha-pak/fedarisha-pak.module';
+import { HandlerModule } from './handler/handler.module';
+import { NetworkStatsModule } from './network-stats/network-stats.module';
 import { StatsModule } from './stats/stats.module';
+import { XrayModule } from './xray-core/xray.module';
 
 @Module({
     imports: [
+        IntegrationsModule,
         AsnLmdbModule,
         NetworkStatsModule,
         PluginModule,

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { Injectable, Logger } from '@nestjs/common';
 
-import { ICommandResponse } from '@common/types/command-response.type';
+import { TResult } from '@common/types';
 import {
     ProbeFedarishaUserCommand,
     ProvisionFedarishaUserCommand,
@@ -68,7 +68,7 @@ export class FedarishaPakService {
 
     public async provisionUser(
         body: ProvisionFedarishaUserCommand.Request,
-    ): Promise<ICommandResponse<ProvisionFedarishaUserCommand.Response['response']>> {
+    ): Promise<TResult<ProvisionFedarishaUserCommand.Response['response']>> {
         const storage = await this.resolveStorage(body.inboundTag);
         if (!storage) {
             return this.failProvision(
@@ -122,7 +122,7 @@ export class FedarishaPakService {
 
     public async revokeUser(
         body: RevokeFedarishaUserCommand.Request,
-    ): Promise<ICommandResponse<RevokeFedarishaUserCommand.Response['response']>> {
+    ): Promise<TResult<RevokeFedarishaUserCommand.Response['response']>> {
         const storage = await this.resolveStorage(body.inboundTag);
         if (!storage) {
             return this.failRevoke(`fedarisha inbound ${body.inboundTag} not found in xray config`);
@@ -141,7 +141,7 @@ export class FedarishaPakService {
 
     public async probeUser(
         body: ProbeFedarishaUserCommand.Request,
-    ): Promise<ICommandResponse<ProbeFedarishaUserCommand.Response['response']>> {
+    ): Promise<TResult<ProbeFedarishaUserCommand.Response['response']>> {
         const storage = await this.resolveStorage(body.inboundTag);
         if (!storage) {
             return this.failProbe(`fedarisha inbound ${body.inboundTag} not found in xray config`);
@@ -327,7 +327,7 @@ export class FedarishaPakService {
 
     private failProvision(
         error: string,
-    ): ICommandResponse<ProvisionFedarishaUserCommand.Response['response']> {
+    ): TResult<ProvisionFedarishaUserCommand.Response['response']> {
         return {
             isOk: true,
             response: { isOk: false, accessKey: null, secretKey: null, error },
@@ -336,13 +336,13 @@ export class FedarishaPakService {
 
     private failRevoke(
         error: string,
-    ): ICommandResponse<RevokeFedarishaUserCommand.Response['response']> {
+    ): TResult<RevokeFedarishaUserCommand.Response['response']> {
         return { isOk: true, response: { isOk: false, error } };
     }
 
     private failProbe(
         error: string,
-    ): ICommandResponse<ProbeFedarishaUserCommand.Response['response']> {
+    ): TResult<ProbeFedarishaUserCommand.Response['response']> {
         return { isOk: true, response: { isOk: false, exists: false, error } };
     }
 }

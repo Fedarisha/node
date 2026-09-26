@@ -43,4 +43,5 @@ lerna-debug.log*
 
 /samples
 
-supervisord-dev.conf
+/build
+*.tar.gz
