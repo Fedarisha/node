@@ -1,12 +1,14 @@
 import { z } from 'zod';
 
-import { NodeSystemSchema } from '../../models';
 import { REST_API } from '../../api';
+import { NodeMetadataSchema, NodeSystemSchema } from '../../models';
 
 export namespace StartXrayCommand {
     export const url = REST_API.XRAY.START;
     export const RequestSchema = z.object({
         internals: z.object({
+            metadata: NodeMetadataSchema.optional(),
+            integrations: z.record(z.string(), z.unknown()).optional(),
             forceRestart: z.boolean().default(false),
             hashes: z.object({
                 emptyConfig: z.string(),
@@ -19,7 +21,7 @@ export namespace StartXrayCommand {
                 ),
             }),
         }),
-        xrayConfig: z.record(z.unknown()),
+        xrayConfig: z.record(z.string(), z.unknown()),
     });
 
     export type Request = z.infer<typeof RequestSchema>;

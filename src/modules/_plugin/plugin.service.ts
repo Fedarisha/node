@@ -1,20 +1,21 @@
 import { hasher } from 'node-object-hash';
 
 import { Injectable, Logger } from '@nestjs/common';
-import { CommandBus } from '@nestjs/cqrs';
+import { CommandBus, QueryBus } from '@nestjs/cqrs';
 
 import { NodePluginSchema, type TNodePlugin } from '@remnawave/node-plugins';
 
-import { ICommandResponse } from '@common/types/command-response.type';
+import { ok, TResult } from '@common/types/result.type';
 import { XRAY_TORRENT_BLOCKER_OUTBOUND_TAG } from '@libs/contracts/constants';
 
-import { TorrentBlockerReportsResponseModel } from './models/torrent-blocker-reports.response.model';
+import { GetAsnPrefixesQuery } from '../asn-lmdb/queries/get-asn-prefixes/get-asn-prefixes.query';
 import { RemoveOutboundCommand } from '../handler/commands/remove-outbound/remove-outbound.command';
-import { PluginStateService } from './services/plugin-state.service';
 import { StopXrayCommand } from '../xray-core/commands/stop-xray';
-import { NftService } from './services/nft.service';
-import { GenericResponseModel } from './models';
 import { SyncRequestDto } from './dtos';
+import { GenericResponseModel } from './models';
+import { TorrentBlockerReportsResponseModel } from './models/torrent-blocker-reports.response.model';
+import { NftService } from './services/nft.service';
+import { PluginStateService } from './services/plugin-state.service';
 
 @Injectable()
 export class PluginService {
@@ -25,15 +26,16 @@ export class PluginService {
         private readonly state: PluginStateService,
         private readonly nftService: NftService,
         private readonly commandBus: CommandBus,
+        private readonly queryBus: QueryBus,
     ) {}
 
-    public async sync(body: SyncRequestDto): Promise<ICommandResponse<GenericResponseModel>> {
+    public async sync(body: SyncRequestDto): Promise<TResult<GenericResponseModel>> {
         try {
             const { plugin } = body;
 
             if (!plugin) {
                 if (!this.state.hasActivePlugin()) {
-                    return { isOk: true, response: new GenericResponseModel(false) };
+                    return ok(new GenericResponseModel(false));
                 }
 
                 this.logger.log(
@@ -47,14 +49,14 @@ export class PluginService {
                     }),
                 );
 
-                return { isOk: true, response: new GenericResponseModel(true) };
+                return ok(new GenericResponseModel(true));
             }
 
             const configHash = this.hashFn(plugin.config);
 
             if (!this.state.isConfigChanged(configHash)) {
                 this.logger.debug('[PLUGIN] Config unchanged. Skipping sync.');
-                return { isOk: true, response: new GenericResponseModel(true) };
+                return ok(new GenericResponseModel(true));
             }
 
             const parsed = await NodePluginSchema.safeParseAsync(plugin.config);
@@ -68,21 +70,18 @@ export class PluginService {
                         withPluginCleanup: false,
                     }),
                 );
-                return { isOk: true, response: new GenericResponseModel(false) };
+                return ok(new GenericResponseModel(false));
             }
 
             const currentTorrentBlocker = this.state.torrentBlocker.isEnabled;
             const currentTorrentBlockerIncludeRuleTags = new Set(
                 this.state.torrentBlocker.includeRuleTagsSet,
             );
+            const currentTorrentBlockerRulePosition = this.state.torrentBlocker.rulePosition;
 
             const pluginData = parsed.data;
 
-            const sharedMap = new Map(
-                pluginData.sharedLists
-                    .filter((list) => list.type === 'ipList')
-                    .map((list) => [list.name, list.items]),
-            );
+            const sharedMap = await this.resolveSharedLists(pluginData.sharedLists);
 
             this.state.resetState();
             this.state.cleanUpActivePlugin();
@@ -90,6 +89,7 @@ export class PluginService {
 
             this.syncConnectionDrop(pluginData, sharedMap);
             this.syncTorrentBlocker(pluginData, sharedMap);
+            this.syncPreStart(pluginData);
 
             await this.syncIngressFilter(pluginData, sharedMap);
             await this.syncEgressFilter(pluginData, sharedMap);
@@ -107,15 +107,19 @@ export class PluginService {
                     new RemoveOutboundCommand(XRAY_TORRENT_BLOCKER_OUTBOUND_TAG),
                 );
             } else {
+                const stillEnabled = wasEnabled && nowEnabled;
+
                 const needsRestart =
                     (wasEnabled && !nowEnabled) ||
                     (!wasEnabled && nowEnabled) ||
-                    (wasEnabled &&
-                        nowEnabled &&
+                    (stillEnabled &&
                         this.hashFn([...currentTorrentBlockerIncludeRuleTags].sort()) !==
                             this.hashFn(
                                 [...(pluginData.torrentBlocker?.includeRuleTags ?? [])].sort(),
-                            ));
+                            )) ||
+                    (stillEnabled &&
+                        currentTorrentBlockerRulePosition !==
+                            (pluginData.torrentBlocker?.rulePlacement ?? 0));
 
                 if (needsRestart) {
                     await this.commandBus.execute(
@@ -124,10 +128,10 @@ export class PluginService {
                 }
             }
 
-            return { isOk: true, response: new GenericResponseModel(true) };
+            return ok(new GenericResponseModel(true));
         } catch (error) {
             this.logger.error(error);
-            return { isOk: true, response: new GenericResponseModel(false) };
+            return ok(new GenericResponseModel(false));
         }
     }
     public async resetPlugins(): Promise<void> {
@@ -145,6 +149,25 @@ export class PluginService {
         this.state.connectionDrop.setWhitelistIps(ips);
 
         this.logger.log(`[PLUGIN] Connection-Drop: ${ips.length} whitelisted IPs synced.`);
+    }
+
+    private syncPreStart(pluginData: TNodePlugin): void {
+        if (!pluginData.preStart) return;
+        if (!pluginData.preStart.enabled) return;
+        if (!this.state.plugins.preStart) return;
+
+        const cleanupSockets = pluginData.preStart.cleanupSockets;
+
+        this.state.preStart.configure({
+            enabled: pluginData.preStart.enabled,
+            cleanupSockets,
+        });
+
+        const { enabled, files } = this.state.preStart.cleanupSocketsConfig;
+
+        this.logger.log(
+            `[PLUGIN] Pre-Start: socket cleanup ${enabled ? `enabled, ${files.length} path(s)` : 'disabled'}.`,
+        );
     }
 
     private async syncIngressFilter(
@@ -183,14 +206,15 @@ export class PluginService {
         if (!pluginData.torrentBlocker.enabled) return;
         if (!this.nftService.isAvailable) return;
 
-        const { blockDuration, ignoreLists } = pluginData.torrentBlocker;
+        const { blockDuration, ignoreLists, rulePlacement } = pluginData.torrentBlocker;
 
         const ips = this.resolveIpList(ignoreLists.ip ?? [], sharedMap);
         const users = ignoreLists.userId?.map(String) ?? [];
 
         this.state.torrentBlocker.setIgnoredIps(ips);
         this.state.torrentBlocker.setIgnoredUsers(users);
-        this.state.torrentBlocker.configure(blockDuration);
+        this.state.torrentBlocker.configure(blockDuration, rulePlacement);
+        this.state.torrentBlocker.setWebhookUrl(pluginData.torrentBlocker.webhookUrl);
         this.state.torrentBlocker.setIncludeRuleTags(pluginData.torrentBlocker.includeRuleTags);
 
         this.logger.log(
@@ -212,17 +236,53 @@ export class PluginService {
         });
     }
 
-    public async collectReports(): Promise<ICommandResponse<TorrentBlockerReportsResponseModel>> {
+    private async resolveSharedLists(
+        sharedLists: TNodePlugin['sharedLists'],
+    ): Promise<Map<string, string[]>> {
+        const sharedMap = new Map<string, string[]>();
+
+        for (const list of sharedLists) {
+            switch (list.type) {
+                case 'ipList':
+                    sharedMap.set(list.name, list.items);
+                    break;
+                case 'asList':
+                    const prefixes: string[] = [];
+
+                    for (const asn of list.items) {
+                        const resolved = await this.queryBus.execute(new GetAsnPrefixesQuery(asn));
+                        if (!resolved) {
+                            this.logger.warn(`[PLUGIN] ASN ${asn} not found`);
+                            continue;
+                        }
+                        this.logger.log(
+                            `[PLUGIN] ASN ${asn} resolved: ${resolved.ipv4.length} IPv4, ${resolved.ipv6.length} IPv6`,
+                        );
+                        prefixes.push(...resolved.ipv4, ...resolved.ipv6);
+                    }
+
+                    sharedMap.set(list.name, prefixes);
+                    break;
+                default:
+                    this.logger.warn(`[PLUGIN] Unknown shared list type: ${list}`);
+                    break;
+            }
+        }
+
+        return sharedMap;
+    }
+
+    public async collectReports(): Promise<TResult<TorrentBlockerReportsResponseModel>> {
         try {
             if (!this.state.torrentBlocker.reportsCount) {
-                return { isOk: true, response: new TorrentBlockerReportsResponseModel([]) };
+                return ok(new TorrentBlockerReportsResponseModel([]));
             }
 
             const reports = this.state.torrentBlocker.flushReports();
-            return { isOk: true, response: new TorrentBlockerReportsResponseModel(reports) };
+            return ok(new TorrentBlockerReportsResponseModel(reports));
         } catch (error) {
             this.logger.error(error);
-            return { isOk: true, response: new TorrentBlockerReportsResponseModel([]) };
+            return ok(new TorrentBlockerReportsResponseModel([]));
         }
     }
 }

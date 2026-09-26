@@ -1,15 +1,16 @@
-import { hasCapNetAdmin } from 'sockdestroy';
 import { NftManager } from 'nftables-napi';
+import { hasCapNetAdmin } from 'sockdestroy';
 
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { EventBus } from '@nestjs/cqrs';
 
-import { ICommandResponse } from '@common/types/command-response.type';
+import { TypedConfigService } from '@common/config/app-config';
+import { ok, TResult } from '@common/types/result.type';
 
-import { GenericResponseModel } from '../models/generic.response.model';
 import { NFT_TABLES_CONSTANTS } from '../constants/nfttables.contants';
 import { BlockIpsRequestDto, UnblockIpsRequestDto } from '../dtos';
 import { DropConnectionsEvent } from '../events/drop-connections';
+import { GenericResponseModel } from '../models/generic.response.model';
 import { PluginStateService } from './plugin-state.service';
 
 @Injectable()
@@ -21,6 +22,7 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
     constructor(
         private readonly state: PluginStateService,
         private readonly eventBus: EventBus,
+        private readonly configService: TypedConfigService,
     ) {}
 
     get isAvailable(): boolean {
@@ -29,6 +31,8 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
 
     public async onModuleInit(): Promise<void> {
         const capNetAdmin = hasCapNetAdmin();
+        const logging = this.configService.getOrThrow('NFTABLES_LOGGING');
+        const acceptReplyTraffic = this.configService.getOrThrow('NFTABLES_ACCEPT_REPLY_TRAFFIC');
 
         if (!capNetAdmin) return;
 
@@ -37,6 +41,7 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
             ingressFilter: false,
             torrentBlocker: false,
             egressFilter: false,
+            preStart: true,
         });
 
         try {
@@ -48,6 +53,8 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
                 ],
                 egressAddrSets: [NFT_TABLES_CONSTANTS.EGRESS_FILTER_IP_SET_NAME],
                 egressPortSets: [NFT_TABLES_CONSTANTS.EGRESS_FILTER_PORT_SET_NAME],
+                logging,
+                acceptReplyTraffic,
             });
             await this.recreateTables();
 
@@ -58,6 +65,7 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
                 ingressFilter: true,
                 torrentBlocker: true,
                 egressFilter: true,
+                preStart: true,
             });
         } catch (error) {
             this.logger.error(error);
@@ -142,13 +150,10 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
 
     public async blockIpsController(
         data: BlockIpsRequestDto,
-    ): Promise<ICommandResponse<GenericResponseModel>> {
+    ): Promise<TResult<GenericResponseModel>> {
         try {
             if (!this.nftManager) {
-                return {
-                    isOk: true,
-                    response: new GenericResponseModel(false),
-                };
+                return ok(new GenericResponseModel(false));
             }
 
             const { ips } = data;
@@ -156,28 +161,19 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
                 await this.blockIp(ip.ip, ip.timeout);
             }
 
-            return {
-                isOk: true,
-                response: new GenericResponseModel(true),
-            };
+            return ok(new GenericResponseModel(true));
         } catch (error) {
             this.logger.error(error);
-            return {
-                isOk: true,
-                response: new GenericResponseModel(false),
-            };
+            return ok(new GenericResponseModel(false));
         }
     }
 
     public async unblockIpsController(
         data: UnblockIpsRequestDto,
-    ): Promise<ICommandResponse<GenericResponseModel>> {
+    ): Promise<TResult<GenericResponseModel>> {
         try {
             if (!this.nftManager) {
-                return {
-                    isOk: true,
-                    response: new GenericResponseModel(false),
-                };
+                return ok(new GenericResponseModel(false));
             }
 
             const { ips } = data;
@@ -192,40 +188,25 @@ export class NftService implements OnModuleDestroy, OnModuleInit {
                 set: NFT_TABLES_CONSTANTS.INGRESS_FILTER_IP_SET_NAME,
             });
 
-            return {
-                isOk: true,
-                response: new GenericResponseModel(true),
-            };
+            return ok(new GenericResponseModel(true));
         } catch (error) {
             this.logger.error(error);
-            return {
-                isOk: true,
-                response: new GenericResponseModel(false),
-            };
+            return ok(new GenericResponseModel(false));
         }
     }
 
-    public async recreateTablesController(): Promise<ICommandResponse<GenericResponseModel>> {
+    public async recreateTablesController(): Promise<TResult<GenericResponseModel>> {
         try {
             if (!this.nftManager) {
-                return {
-                    isOk: true,
-                    response: new GenericResponseModel(false),
-                };
+                return ok(new GenericResponseModel(false));
             }
 
             await this.nftManager.createTable();
 
-            return {
-                isOk: true,
-                response: new GenericResponseModel(true),
-            };
+            return ok(new GenericResponseModel(true));
         } catch (error) {
             this.logger.error(error);
-            return {
-                isOk: true,
-                response: new GenericResponseModel(false),
-            };
+            return ok(new GenericResponseModel(false));
         }
     }
 }

@@ -1,36 +1,46 @@
-import { ProcessInfo } from '@kastov/node-supervisord/dist/interfaces';
-import { SupervisordClient } from '@kastov/node-supervisord';
-import { readPackageJSON } from 'pkg-types';
-import { table } from 'table';
 import ems from 'enhanced-ms';
-import pRetry from 'p-retry';
-import semver from 'semver';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import pRetry, { AbortError } from 'p-retry';
 
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { CommandBus, QueryBus } from '@nestjs/cqrs';
-import { ConfigService } from '@nestjs/config';
 
-import { InjectSupervisord } from '@remnawave/supervisord-nestjs';
-import { InjectXtls } from '@remnawave/xtls-sdk-nestjs';
 import { XtlsApi } from '@remnawave/xtls-sdk';
+import { InjectXtls } from '@remnawave/xtls-sdk-nestjs';
 
-import { getSystemInfo, getSystemStats } from '@common/utils/get-system-stats';
-import { ICommandResponse } from '@common/types/command-response.type';
+import { TypedConfigService } from '@common/config/app-config';
+import { ok, TResult } from '@common/types';
 import { generateApiConfig } from '@common/utils/generate-api-config';
-import { KNOWN_ERRORS, REMNAWAVE_NODE_KNOWN_ERROR } from '@libs/contracts/constants';
+import { getSystemInfo, getSystemStats } from '@common/utils/get-system-stats';
 import { StartXrayCommand } from '@libs/contracts/commands';
+import { KNOWN_ERRORS } from '@libs/contracts/constants';
 
+import { IntegrationsService } from '@integration-modules/integrations.service';
+
+import { ResetPluginsCommand } from '../_plugin/commands/reset-plugins/reset-plugins.command';
+import { RunPreStartCommand } from '../_plugin/commands/run-pre-start/run-pre-start.command';
+import { GetTorrentBlockerStateQuery } from '../_plugin/queries/get-torrent-blocker-state';
+import { InternalService } from '../internal/internal.service';
+import { GetInterfaceStatsQuery } from '../network-stats/queries/get-interface-stats/get-interface-stats.query';
+import { CoreLoaderService } from './core-loader.service';
+import { GeodataService } from './geodata.service';
 import {
     GetNodeHealthCheckResponseModel,
     StartXrayResponseModel,
     StopXrayResponseModel,
 } from './models';
-import { GetInterfaceStatsQuery } from '../network-stats/queries/get-interface-stats/get-interface-stats.query';
-import { ResetPluginsCommand } from '../_plugin/commands/reset-plugins/reset-plugins.command';
-import { GetTorrentBlockerStateQuery } from '../_plugin/queries/get-torrent-blocker-state';
-import { InternalService } from '../internal/internal.service';
+import { XrayProcessService } from './xray-process.service';
 
-const XRAY_PROCESS_NAME = 'xray' as const;
+const XRAY_LOG_FILE = '/var/log/xray/current' as const;
+const execFileAsync = promisify(execFile);
+
+class XrayProcessDownError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'XrayProcessDownError';
+    }
+}
 
 @Injectable()
 export class XrayService implements OnApplicationBootstrap {
@@ -39,6 +49,7 @@ export class XrayService implements OnApplicationBootstrap {
     private readonly internal: {
         socketPath: string;
         token: string;
+        xtlsApiSocketPath: string;
     };
 
     private readonly xrayPath: string;
@@ -49,45 +60,38 @@ export class XrayService implements OnApplicationBootstrap {
     private nodeVersion: string = '0.0.0';
     constructor(
         @InjectXtls() private readonly xtlsSdk: XtlsApi,
-        @InjectSupervisord() private readonly supervisordApi: SupervisordClient,
+        private readonly xrayProcess: XrayProcessService,
+        private readonly geodataService: GeodataService,
+        private readonly coreLoaderService: CoreLoaderService,
+        private readonly integrations: IntegrationsService,
         private readonly internalService: InternalService,
-        private readonly configService: ConfigService,
+        private readonly configService: TypedConfigService,
         private readonly queryBus: QueryBus,
         private readonly commandBus: CommandBus,
     ) {
         this.internal = {
-            socketPath: this.configService.getOrThrow<string>('INTERNAL_SOCKET_PATH'),
-            token: this.configService.getOrThrow<string>('INTERNAL_REST_TOKEN'),
+            socketPath: this.configService.getOrThrow('INTERNAL_SOCKET_PATH'),
+            token: this.configService.getOrThrow('INTERNAL_REST_TOKEN'),
+            xtlsApiSocketPath: this.configService.getOrThrow('XTLS_API_SOCKET_PATH'),
         };
 
-        this.xrayPath = '/usr/local/bin/xray';
+        this.xrayPath = '/usr/local/bin/rw-core';
         this.xrayVersion = null;
 
         this.isXrayStartedProccesing = false;
-        this.disableHashedSetCheck = this.configService.getOrThrow<boolean>(
-            'DISABLE_HASHED_SET_CHECK',
-        );
+        this.disableHashedSetCheck = this.configService.getOrThrow('DISABLE_HASHED_SET_CHECK');
     }
 
     async onApplicationBootstrap() {
         try {
-            const pkg = await readPackageJSON();
+            await this.refreshXrayVersion();
+            this.nodeVersion = __RWNODE_VERSION__ ?? '0.0.0';
 
-            this.xrayVersion = this.getXrayVersionFromEnv();
-            this.nodeVersion = pkg.version ?? '0.0.0';
-
-            await this.supervisordApi.getState();
-        } catch (error: unknown) {
-            if (
-                error !== null &&
-                typeof error === 'object' &&
-                'code' in error &&
-                error.code === 'ENOENT'
-            ) {
-                this.logger.error('Supervisord socket file not found, exiting...');
+            if (!this.xrayProcess.isControlAvailable()) {
+                this.logger.error('s6 xray control socket not found, exiting...');
                 process.exit(1);
             }
-
+        } catch (error: unknown) {
             this.logger.error(`Error in Application Bootstrap: ${error}`);
         }
 
@@ -97,7 +101,7 @@ export class XrayService implements OnApplicationBootstrap {
     public async startXray(
         body: StartXrayCommand.Request,
         ip: string,
-    ): Promise<ICommandResponse<StartXrayResponseModel>> {
+    ): Promise<TResult<StartXrayResponseModel>> {
         const interfaceStats = await this.queryBus.execute(new GetInterfaceStatsQuery());
         const tm = performance.now();
         const system = {
@@ -106,24 +110,43 @@ export class XrayService implements OnApplicationBootstrap {
             interface: interfaceStats,
         };
 
+        if (this.isXrayStartedProccesing) {
+            this.logger.warn('Request already in progress');
+            return ok(
+                new StartXrayResponseModel(
+                    false,
+                    this.xrayVersion,
+                    'Request already in progress',
+                    {
+                        version: this.nodeVersion,
+                    },
+                    system,
+                ),
+            );
+        }
+
+        this.isXrayStartedProccesing = true;
+
         try {
-            if (this.isXrayStartedProccesing) {
-                this.logger.warn('Request already in progress');
-                return {
-                    isOk: true,
-                    response: new StartXrayResponseModel(
+            const integrations = await this.integrations.sync(
+                body.internals.integrations,
+                body.internals.metadata,
+            );
+
+            if (integrations.error) {
+                this.logger.error(`Failed to sync integrations: ${integrations.error}`);
+                return ok(
+                    new StartXrayResponseModel(
                         false,
-                        this.xrayVersion,
-                        'Request already in progress',
+                        null,
+                        integrations.error,
                         {
                             version: this.nodeVersion,
                         },
                         system,
                     ),
-                };
+                );
             }
-
-            this.isXrayStartedProccesing = true;
 
             if (this.isXrayOnline && !this.disableHashedSetCheck && !body.internals.forceRestart) {
                 const { isOk } = await this.xtlsSdk.stats.getSysStats();
@@ -140,9 +163,8 @@ export class XrayService implements OnApplicationBootstrap {
                 }
 
                 if (!shouldRestart) {
-                    return {
-                        isOk: true,
-                        response: new StartXrayResponseModel(
+                    return ok(
+                        new StartXrayResponseModel(
                             true,
                             this.xrayVersion,
                             null,
@@ -151,7 +173,7 @@ export class XrayService implements OnApplicationBootstrap {
                             },
                             system,
                         ),
-                    };
+                    );
                 }
             }
 
@@ -159,107 +181,69 @@ export class XrayService implements OnApplicationBootstrap {
                 this.logger.warn('Force restart requested');
             }
 
-            const isTorrentBlockerEnabled = await this.queryBus.execute(
-                new GetTorrentBlockerStateQuery(),
-            );
+            const tblockerState = await this.queryBus.execute(new GetTorrentBlockerStateQuery());
 
             const fullConfig = generateApiConfig({
                 config: body.xrayConfig,
-                torrentBlockerState: isTorrentBlockerEnabled,
+                torrentBlockerState: tblockerState,
                 internal: this.internal,
             });
 
             await this.internalService.extractUsersFromConfig(body.internals.hashes, fullConfig);
 
+            await this.coreLoaderService.prepare(fullConfig.geodata);
+            await this.geodataService.prepare(fullConfig.geodata);
+
             const xrayProcess = await this.restartXrayProcess();
 
             if (xrayProcess.error) {
-                if (xrayProcess.error.includes('XML-RPC fault: SPAWN_ERROR: xray')) {
-                    this.logger.error(REMNAWAVE_NODE_KNOWN_ERROR, {
-                        timestamp: new Date().toISOString(),
-                        rawError: xrayProcess.error,
-                        ...KNOWN_ERRORS.XRAY_FAILED_TO_START,
-                    });
-                } else {
-                    this.logger.error(xrayProcess.error);
-                }
+                this.logger.error(`Failed to (re)start Xray process via s6: ${xrayProcess.error}`);
 
-                return {
-                    isOk: true,
-                    response: new StartXrayResponseModel(
+                return ok(
+                    new StartXrayResponseModel(
                         false,
                         null,
                         xrayProcess.error,
-                        {
-                            version: this.nodeVersion,
-                        },
+                        { version: this.nodeVersion },
                         system,
                     ),
-                };
+                );
             }
 
-            let isStarted = await this.getXrayInternalStatus();
-
-            if (!isStarted && xrayProcess.processInfo!.state === 20) {
-                isStarted = await this.getXrayInternalStatus();
-            }
+            const { isStarted, error: startError } = await this.getXrayInternalStatus();
 
             if (!isStarted) {
                 this.isXrayOnline = false;
 
-                this.logger.error(
-                    '\n' +
-                        table(
-                            [
-                                ['Version', this.xrayVersion],
-                                ['Master IP', ip],
-                                ['Internal Status', isStarted],
-                                ['Error', xrayProcess.error],
-                            ],
-                            {
-                                header: {
-                                    content: 'Xray failed to start',
-                                    alignment: 'center',
-                                },
-                            },
-                        ),
-                );
+                this.logger.error(`Xray Core v${this.xrayVersion} failed to start.`, {
+                    timestamp: new Date().toISOString(),
+                    ...KNOWN_ERRORS.XRAY_FAILED_TO_START,
+                });
 
-                return {
-                    isOk: true,
-                    response: new StartXrayResponseModel(
+                const tail = await this.dumpTailBlock(XRAY_LOG_FILE, 5);
+                const logReason = tail.at(-1)?.trim().slice(0, 500);
+
+                return ok(
+                    new StartXrayResponseModel(
                         isStarted,
                         this.xrayVersion,
-                        xrayProcess.error,
+                        logReason ? `${startError} · ${logReason}` : startError,
                         {
                             version: this.nodeVersion,
                         },
                         system,
                     ),
-                };
+                );
             }
 
             this.isXrayOnline = true;
 
-            this.logger.log(
-                '\n' +
-                    table(
-                        [
-                            ['Version', this.xrayVersion],
-                            ['Master IP', ip],
-                        ],
-                        {
-                            header: {
-                                content: 'Xray started',
-                                alignment: 'center',
-                            },
-                        },
-                    ),
-            );
+            await this.refreshXrayVersion();
 
-            return {
-                isOk: true,
-                response: new StartXrayResponseModel(
+            this.logger.log(`✔ XRay Core v${this.xrayVersion} is up and running.`);
+
+            return ok(
+                new StartXrayResponseModel(
                     isStarted,
                     this.xrayVersion,
                     null,
@@ -268,7 +252,7 @@ export class XrayService implements OnApplicationBootstrap {
                     },
                     system,
                 ),
-            };
+            );
         } catch (error) {
             let errorMessage = null;
             if (error instanceof Error) {
@@ -277,9 +261,8 @@ export class XrayService implements OnApplicationBootstrap {
 
             this.logger.error(`Failed to start Xray: ${errorMessage}`);
 
-            return {
-                isOk: true,
-                response: new StartXrayResponseModel(
+            return ok(
+                new StartXrayResponseModel(
                     false,
                     null,
                     errorMessage,
@@ -288,14 +271,13 @@ export class XrayService implements OnApplicationBootstrap {
                     },
                     system,
                 ),
-            };
+            );
         } finally {
             this.logger.log(
-                'Attempt to start XTLS took: ' +
-                    ems(performance.now() - tm, {
-                        extends: 'short',
-                        includeMs: true,
-                    }),
+                `Attempt to start XTLS took: ${ems(performance.now() - tm, {
+                    extends: 'short',
+                    includeMs: true,
+                })} (IP: ${ip})`,
             );
 
             this.isXrayStartedProccesing = false;
@@ -305,7 +287,7 @@ export class XrayService implements OnApplicationBootstrap {
     public async stopXray(args: {
         withPluginCleanup?: boolean;
         withOnlineCheck?: boolean;
-    }): Promise<ICommandResponse<StopXrayResponseModel>> {
+    }): Promise<TResult<StopXrayResponseModel>> {
         const { withPluginCleanup = false, withOnlineCheck = false } = args;
         try {
             if (withPluginCleanup) {
@@ -313,139 +295,167 @@ export class XrayService implements OnApplicationBootstrap {
             }
 
             if (withOnlineCheck && !this.isXrayOnline) {
-                return {
-                    isOk: true,
-                    response: new StopXrayResponseModel(true),
-                };
+                return ok(new StopXrayResponseModel(true));
             }
 
             await this.killAllXrayProcesses();
+            await this.integrations.stop();
 
             this.isXrayOnline = false;
             this.internalService.cleanup();
 
-            return {
-                isOk: true,
-                response: new StopXrayResponseModel(true),
-            };
+            return ok(new StopXrayResponseModel(true));
         } catch (error) {
             this.logger.error(`Failed to stop Xray Process: ${error}`);
-            return {
-                isOk: true,
-                response: new StopXrayResponseModel(false),
-            };
+            return ok(new StopXrayResponseModel(false));
         }
     }
 
-    public async getNodeHealthCheck(): Promise<ICommandResponse<GetNodeHealthCheckResponseModel>> {
+    public async getNodeHealthCheck(): Promise<TResult<GetNodeHealthCheckResponseModel>> {
         try {
-            return {
-                isOk: true,
-                response: new GetNodeHealthCheckResponseModel(
+            return ok(
+                new GetNodeHealthCheckResponseModel(
                     true,
                     this.isXrayOnline,
                     this.xrayVersion,
                     this.nodeVersion,
                 ),
-            };
+            );
         } catch (error) {
             this.logger.error(`Failed to get node health check: ${error}`);
 
-            return {
-                isOk: true,
-                response: new GetNodeHealthCheckResponseModel(false, false, null, this.nodeVersion),
-            };
+            return ok(new GetNodeHealthCheckResponseModel(false, false, null, this.nodeVersion));
         }
     }
 
     public async killAllXrayProcesses(): Promise<void> {
         try {
-            await this.supervisordApi.stopProcess(XRAY_PROCESS_NAME, true);
+            await this.xrayProcess.stop();
 
-            this.logger.log('Supervisord: Xray processes killed.');
+            this.logger.log('s6: Xray process stopped.');
         } catch (error) {
-            this.logger.log(`Supervisord: No existing Xray processes found. Error: ${error}`);
+            this.logger.log(`s6: Failed to stop Xray process. Error: ${error}`);
         }
     }
 
-    private getXrayVersionFromEnv(): null | string {
-        const version = semver.valid(semver.coerce(process.env.XRAY_CORE_VERSION));
+    private async refreshXrayVersion(): Promise<void> {
+        const version = await this.xrayProcess.getCoreVersion();
 
         if (version) {
             this.xrayVersion = version;
         }
-
-        return version;
     }
 
     public getXrayInfo(): {
         version: string | null;
         path: string;
     } {
-        const version = this.getXrayVersionFromEnv();
-
-        if (version) {
-            this.xrayVersion = version;
-        }
-
         return {
-            version: version,
+            version: this.xrayVersion,
             path: this.xrayPath,
         };
     }
 
-    private async getXrayInternalStatus(): Promise<boolean> {
+    private async getXrayInternalStatus(): Promise<{
+        isStarted: boolean;
+        error: string | null;
+    }> {
+        const tm = performance.now();
+
+        const startedPid = (await this.xrayProcess.getStatus()).pid;
+
         try {
-            return await pRetry(
+            await pRetry(
                 async () => {
                     const { isOk, message } = await this.xtlsSdk.stats.getSysStats();
-
-                    if (!isOk) {
-                        throw new Error(message);
+                    if (isOk) {
+                        return;
                     }
 
-                    return true;
+                    const status = await this.xrayProcess.getStatus();
+
+                    if (!status.up || (startedPid !== null && status.pid !== startedPid)) {
+                        throw new AbortError(
+                            new XrayProcessDownError(
+                                `Xray Core process is not running anymore (s6: ${await this.xrayProcess.getStatusLine()})`,
+                            ),
+                        );
+                    }
+
+                    throw new Error(message);
                 },
                 {
-                    retries: 10,
-                    minTimeout: 2000,
+                    retries: 30,
+                    minTimeout: 100,
                     maxTimeout: 2000,
-                    onFailedAttempt: (error) => {
-                        this.logger.debug(
-                            `Get Xray internal status attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`,
+                    factor: 1.5,
+                    onFailedAttempt: (context) => {
+                        this.logger.warn(
+                            `▸ XRay Core status check, ${context.attemptNumber}/${context.attemptNumber + context.retriesLeft} · elapsed ${ems(
+                                performance.now() - tm,
+                                {
+                                    extends: 'short',
+                                    includeMs: true,
+                                },
+                            )} · retrying in ${context.retryDelay}ms`,
                         );
                     },
                 },
             );
+
+            return { isStarted: true, error: null };
         } catch (error) {
             this.logger.error(`Failed to get Xray internal status: ${error}`);
-            return false;
+
+            return {
+                isStarted: false,
+                error:
+                    error instanceof XrayProcessDownError
+                        ? error.message
+                        : 'Xray Core did not become ready in time',
+            };
         }
     }
 
     private async restartXrayProcess(): Promise<{
-        processInfo: ProcessInfo | null;
         error: string | null;
     }> {
         try {
-            const processState = await this.supervisordApi.getProcessInfo(XRAY_PROCESS_NAME);
+            await this.xrayProcess.stop();
 
-            // Reference: https://supervisord.org/subprocess.html#process-states
-            if (processState.state === 20) {
-                await this.supervisordApi.stopProcess(XRAY_PROCESS_NAME, true);
-            }
+            await this.commandBus.execute(new RunPreStartCommand());
 
-            await this.supervisordApi.startProcess(XRAY_PROCESS_NAME, true);
+            await this.xrayProcess.start();
 
-            return {
-                processInfo: await this.supervisordApi.getProcessInfo(XRAY_PROCESS_NAME),
-                error: null,
-            };
+            return { error: null };
         } catch (error) {
             return {
-                processInfo: null,
                 error: error instanceof Error ? error.message : 'Unknown error',
             };
         }
+    }
+
+    public async tailLogLines(path: string, n = 10): Promise<string[]> {
+        try {
+            const { stdout } = await execFileAsync('tail', ['-n', String(n), path]);
+            return stdout.split('\n').filter(Boolean);
+        } catch {
+            return [];
+        }
+    }
+
+    private async dumpTailBlock(path: string, lines: number): Promise<string[]> {
+        const tail = await this.tailLogLines(path, lines);
+        if (tail.length === 0) return tail;
+
+        this.logger.error(
+            [
+                'Xray Core Log Tail',
+                `${'─'.repeat(8)} ${path} (${tail.length} lines) ${'─'.repeat(8)}`,
+                ...tail.map((l) => `│ ${l}`),
+            ].join('\n'),
+        );
+
+        return tail;
     }
 }

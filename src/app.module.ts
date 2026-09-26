@@ -1,61 +1,39 @@
+import { experimental } from '@grpc/grpc-js';
 import { ChannelCredentials } from 'nice-grpc';
 
-import { ConfigModule, ConfigService } from '@nestjs/config';
 import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
+import { ScheduleModule } from '@nestjs/schedule';
 
-import { SupervisordNestjsModule } from '@remnawave/supervisord-nestjs';
 import { XtlsSdkNestjsModule } from '@remnawave/xtls-sdk-nestjs';
 
-import { JwtStrategy } from '@common/guards/jwt-guards/strategies/validate-token';
-import { validateEnvConfig } from '@common/utils/validate-env-config';
-import { getClientCerts } from '@common/utils/generate-mtls-certs';
-import { getXtlsApiPort } from '@common/utils/get-initial-ports';
-import { configSchema, Env } from '@common/config/app-config';
+import { TypedConfigService } from '@common/config/app-config/typed-config.service';
+import { CommonConfigModule } from '@common/config/common-config';
 import { getJWTConfig } from '@common/config/jwt/jwt.config';
+import { JwtStrategy } from '@common/guards/jwt-guards/strategies/validate-token';
+import { AbstractUdsResolver } from '@common/utils/unix-abstract.resolver';
 
-import { RemnawaveNodeModules } from './modules/remnawave-node.modules';
 import { InternalModule } from './modules/internal/internal.module';
+import { RemnawaveNodeModules } from './modules/remnawave-node.modules';
+
+experimental.registerResolver('unix-abstract', AbstractUdsResolver);
 
 @Module({
     imports: [
-        ConfigModule.forRoot({
-            isGlobal: true,
-            envFilePath: '.env',
-            validate: (config) => validateEnvConfig<Env>(configSchema, config),
-        }),
+        CommonConfigModule,
+        ScheduleModule.forRoot(),
         XtlsSdkNestjsModule.forRootAsync({
             imports: [],
-            inject: [],
-            useFactory: () => {
-                const certs = getClientCerts();
+            inject: [TypedConfigService],
+            useFactory: (configService: TypedConfigService) => {
                 return {
-                    connectionUrl: `127.0.0.1:${getXtlsApiPort()}`,
-                    credentials: ChannelCredentials.createSsl(
-                        Buffer.from(certs.caCertPem),
-                        Buffer.from(certs.clientKeyPem),
-                        Buffer.from(certs.clientCertPem),
-                        {
-                            rejectUnauthorized: true,
-                        },
-                    ),
+                    connectionUrl: `unix-abstract:///${configService.getOrThrow('XTLS_API_SOCKET_PATH')}`,
+                    credentials: ChannelCredentials.createInsecure(),
                     options: {
                         'grpc.max_receive_message_length': 100_000_000, // 100MB
-                        'grpc.ssl_target_name_override': 'internal.remnawave.local',
                     },
                 };
             },
-        }),
-        SupervisordNestjsModule.forRootAsync({
-            imports: [ConfigModule],
-            inject: [ConfigService],
-            useFactory: (configService: ConfigService) => ({
-                connectionUrl: `http://unix:${configService.getOrThrow<string>('SUPERVISORD_SOCKET_PATH')}:/RPC2`,
-                options: {
-                    username: configService.getOrThrow<string>('SUPERVISORD_USER'),
-                    password: configService.getOrThrow<string>('SUPERVISORD_PASSWORD'),
-                },
-            }),
         }),
         RemnawaveNodeModules,
         InternalModule,

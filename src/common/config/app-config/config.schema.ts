@@ -3,6 +3,15 @@ import { z } from 'zod';
 
 import { parseNodePayloadFromConfigService } from '@common/utils/decode-node-payload';
 
+const booleanString = (def: 'true' | 'false' = 'false') =>
+    z
+        .string()
+        .default(def)
+        .transform((val) => (val === '' ? def : val))
+        .refine((val) => val === 'true' || val === 'false', 'Must be "true" or "false".')
+        .transform((val) => val === 'true')
+        .pipe(z.boolean());
+
 export const configSchema = z
     .object({
         NODE_PORT: z.string().transform((port) => {
@@ -10,28 +19,24 @@ export const configSchema = z
         }),
         SECRET_KEY: z.string(),
         JWT_PUBLIC_KEY: z.string().optional(),
-        DISABLE_HASHED_SET_CHECK: z
-            .string()
-            .default('false')
-            .transform((val) => val === 'true'),
-        XTLS_API_PORT: z.string().transform((port) => {
-            return parseInt(port, 10);
-        }),
+        DISABLE_HASHED_SET_CHECK: booleanString(),
         INTERNAL_REST_TOKEN: z.string(),
-        SUPERVISORD_USER: z.string(),
-        SUPERVISORD_PASSWORD: z.string(),
         INTERNAL_SOCKET_PATH: z.string(),
-        SUPERVISORD_SOCKET_PATH: z.string(),
-        SUPERVISORD_PID_PATH: z.string(),
+        XTLS_API_SOCKET_PATH: z.string(),
+        NFTABLES_LOGGING: booleanString('true'),
+        NFTABLES_ACCEPT_REPLY_TRAFFIC: booleanString('false'),
+        SNI_VERIFICATION: booleanString('false'),
     })
+
     .superRefine((data, ctx) => {
         if (data.SECRET_KEY) {
             try {
                 const parsed = parseNodePayloadFromConfigService(data.SECRET_KEY);
                 data.JWT_PUBLIC_KEY = parsed.jwtPublicKey;
             } catch {
-                ctx.addIssue({
-                    code: z.ZodIssueCode.custom,
+                ctx.issues.push({
+                    code: 'custom',
+                    input: data.SECRET_KEY,
                     message: 'Invalid SECRET_KEY payload',
                 });
             }

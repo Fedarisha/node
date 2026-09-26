@@ -1,29 +1,34 @@
-import { utilities as nestWinstonModuleUtilities, WinstonModule } from 'nest-winston';
+process.title = 'rw-node';
+import 'zod/compile';
 import * as bodyParser from '@kastov/body-parser-with-zstd';
-import { ZodValidationPipe } from 'nestjs-zod';
-import express, { json } from 'express';
-import { createLogger } from 'winston';
 import compression from 'compression';
-import * as winston from 'winston';
-import { Server } from 'https';
-import * as fs from 'node:fs';
+import express, { json } from 'express';
 import helmet from 'helmet';
+import { Server } from 'https';
 import morgan from 'morgan';
+import { utilities as nestWinstonModuleUtilities, WinstonModule } from 'nest-winston';
+import { ZodValidationPipe } from 'nestjs-zod';
+import { createSecureContext, SecureContext, SecureVersion } from 'node:tls';
+import { createLogger } from 'winston';
+import * as winston from 'winston';
 
-import { ConfigService } from '@nestjs/config';
+import { HttpsOptions } from '@nestjs/common/interfaces/external/https-options.interface';
 import { NestFactory } from '@nestjs/core';
 
-import { initializeMTLSCerts } from '@common/utils/generate-mtls-certs';
+import { TypedConfigService } from '@common/config/app-config/typed-config.service';
+import { NotFoundExceptionFilter } from '@common/exception';
+import { acquireInstanceLock } from '@common/utils/acquire-instance-lock';
 import { parseNodePayload } from '@common/utils/decode-node-payload';
+import { makeSniVerifier } from '@common/utils/decode-node-payload/decode-servername.util';
+import { customLogFilter } from '@common/utils/filter-logs';
+import { getDuplicateInstanceMessage } from '@common/utils/get-duplicate-instance-message';
 import { getStartMessage } from '@common/utils/get-start-message';
 import { isDevelopment } from '@common/utils/is-development';
-import { NotFoundExceptionFilter } from '@common/exception';
-import { customLogFilter } from '@common/utils/filter-logs';
+import { ROOT } from '@libs/contracts/api';
 import {
     XRAY_INTERNAL_FULL_PATH,
     XRAY_INTERNAL_FULL_WEBHOOK_PATH,
 } from '@libs/contracts/constants';
-import { REST_API, ROOT } from '@libs/contracts/api';
 
 import { AppModule } from './app.module';
 
@@ -48,23 +53,46 @@ const logger = createLogger({
 
 async function bootstrap(): Promise<void> {
     const internalSocketPath = process.env.INTERNAL_SOCKET_PATH!;
+    const sniVerification = process.env.SNI_VERIFICATION === 'true';
 
-    if (fs.existsSync(internalSocketPath)) {
-        fs.unlinkSync(internalSocketPath);
-    }
+    const nodePayload = parseNodePayload(logger);
 
-    await initializeMTLSCerts();
+    let tlsCertOptions: HttpsOptions;
 
-    const nodePayload = parseNodePayload();
-
-    const app = await NestFactory.create(AppModule, {
-        httpsOptions: {
+    if (sniVerification) {
+        const realCtx: SecureContext = createSecureContext({
             key: nodePayload.nodeKeyPem,
             cert: nodePayload.nodeCertPem,
             ca: [nodePayload.caCertPem],
-            requestCert: true,
-            rejectUnauthorized: true,
-        },
+            minVersion: 'TLSv1.3',
+        });
+
+        const verifySni = makeSniVerifier(nodePayload.caCertPem, nodePayload.jwtPublicKey);
+
+        tlsCertOptions = {
+            SNICallback: (
+                servername: string,
+                cb: (err: Error | null, ctx?: SecureContext) => void,
+            ) => (verifySni(servername) ? cb(null, realCtx) : cb(new Error('unknown sni'))),
+        } as HttpsOptions;
+    } else {
+        tlsCertOptions = {
+            key: nodePayload.nodeKeyPem,
+            cert: nodePayload.nodeCertPem,
+            ca: [nodePayload.caCertPem],
+        } satisfies HttpsOptions;
+    }
+
+    const httpsOptions: { minVersion?: SecureVersion } & HttpsOptions = {
+        ...tlsCertOptions,
+        requestCert: true,
+        rejectUnauthorized: true,
+        minVersion: 'TLSv1.3',
+        handshakeTimeout: 10_000,
+    } as { minVersion?: SecureVersion } & HttpsOptions;
+
+    const app = await NestFactory.create(AppModule, {
+        httpsOptions,
         bodyParser: false,
         logger: WinstonModule.createLogger({
             instance: logger,
@@ -85,7 +113,7 @@ async function bootstrap(): Promise<void> {
 
     app.use(compression());
 
-    const config = app.get(ConfigService);
+    const config = app.get(TypedConfigService);
 
     app.use(helmet());
 
@@ -96,17 +124,12 @@ async function bootstrap(): Promise<void> {
     app.useGlobalFilters(new NotFoundExceptionFilter());
 
     app.setGlobalPrefix(ROOT, {
-        exclude: [
-            XRAY_INTERNAL_FULL_PATH,
-            XRAY_INTERNAL_FULL_WEBHOOK_PATH,
-            '/' + REST_API.VISION.BLOCK_IP,
-            '/' + REST_API.VISION.UNBLOCK_IP,
-        ],
+        exclude: [XRAY_INTERNAL_FULL_PATH, XRAY_INTERNAL_FULL_WEBHOOK_PATH],
     });
 
     app.useGlobalPipes(new ZodValidationPipe());
 
-    await app.listen(Number(config.getOrThrow<string>('NODE_PORT')));
+    await app.listen(config.getOrThrow('NODE_PORT'));
 
     const httpAdapter = app.getHttpAdapter();
     const httpServer = httpAdapter.getInstance();
@@ -124,7 +147,7 @@ async function bootstrap(): Promise<void> {
         },
     );
 
-    const internalServer = internalApp.listen(internalSocketPath);
+    const internalServer = internalApp.listen('\0' + internalSocketPath);
 
     let internalServerClosed = false;
 
@@ -133,10 +156,6 @@ async function bootstrap(): Promise<void> {
         internalServerClosed = true;
 
         internalServer.close(() => {
-            if (fs.existsSync(internalSocketPath)) {
-                fs.unlinkSync(internalSocketPath);
-            }
-
             logger.info('Shutting down...');
         });
     };
@@ -146,15 +165,19 @@ async function bootstrap(): Promise<void> {
     process.on('SIGINT', closeInternalServer);
     process.on('SIGTERM', closeInternalServer);
 
-    logger.info(
-        '\n' +
-            (await getStartMessage(
-                Number(config.getOrThrow<string>('NODE_PORT')),
+    logger.info('\n' + (await getStartMessage(config.getOrThrow('NODE_PORT'), app)) + '\n');
 
-                app,
-            )) +
-            '\n',
-    );
+    if (!(await acquireInstanceLock())) {
+        logger.error('\n' + getDuplicateInstanceMessage() + '\n');
+    }
+
+    if (import.meta.webpackHot) {
+        import.meta.webpackHot.accept();
+        import.meta.webpackHot.dispose(() => app.close());
+    }
 }
 
-void bootstrap();
+void bootstrap().catch((e) => {
+    logger.error(e instanceof Error ? e.message : String(e));
+    process.exit(1);
+});
