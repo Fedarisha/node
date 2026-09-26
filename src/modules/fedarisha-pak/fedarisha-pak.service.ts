@@ -9,11 +9,11 @@ import {
     RevokeFedarishaUserCommand,
 } from '@libs/contracts/commands';
 
+import { InternalService } from '../internal/internal.service';
+import { PakProviderConflictError } from './pak-provider.interface';
 import { IPakStorage, PakService, PakUserAlreadyExistsError } from './pak.service';
 import { ISelectelPakStorage, SelectelPakService } from './selectel-pak.service';
 import { IStaticPakStorage, StaticPakService } from './static-pak.service';
-import { PakProviderConflictError } from './pak-provider.interface';
-import { InternalService } from '../internal/internal.service';
 
 type ProviderKind = 'vkcloud-pak' | 'selectel-iam' | 'static';
 
@@ -26,6 +26,7 @@ interface IRawStorageSettings {
     prefix?: string;
     accessKey?: string;
     secretKey?: string;
+    masterServiceUserId?: string;
     pathStyle?: boolean;
     iam?: {
         accountId?: string;
@@ -312,6 +313,7 @@ export class FedarishaPakService {
             region: raw.region ?? '',
             accessKey: raw.accessKey,
             secretKey: raw.secretKey,
+            masterServiceUserId: raw.masterServiceUserId ?? '',
             basePrefix: raw.prefix ?? '',
             iam: {
                 accountId: iam.accountId,
@@ -334,15 +336,11 @@ export class FedarishaPakService {
         };
     }
 
-    private failRevoke(
-        error: string,
-    ): TResult<RevokeFedarishaUserCommand.Response['response']> {
+    private failRevoke(error: string): TResult<RevokeFedarishaUserCommand.Response['response']> {
         return { isOk: true, response: { isOk: false, error } };
     }
 
-    private failProbe(
-        error: string,
-    ): TResult<ProbeFedarishaUserCommand.Response['response']> {
+    private failProbe(error: string): TResult<ProbeFedarishaUserCommand.Response['response']> {
         return { isOk: true, response: { isOk: false, exists: false, error } };
     }
 }

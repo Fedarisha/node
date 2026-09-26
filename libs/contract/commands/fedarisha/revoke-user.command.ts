@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { REST_API } from '../../api';
+import { FedarishaUserKeySchema } from './user-key.schema';
 
 // Revoke the per-user prefix-scoped S3 access key on the bucket bound to the
 // fedarisha xray inbound on this node. Idempotent: missing key on the bucket
@@ -9,7 +10,7 @@ export namespace RevokeFedarishaUserCommand {
     export const url = REST_API.FEDARISHA.REVOKE_USER;
 
     export const RequestSchema = z.object({
-        userUuid: z.string().uuid(),
+        userUuid: FedarishaUserKeySchema,
         inboundTag: z.string().min(1),
         prefix: z.string().min(1),
     });

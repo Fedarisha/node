@@ -1,12 +1,13 @@
 import { z } from 'zod';
 
 import { REST_API } from '../../api';
+import { FedarishaUserKeySchema } from './user-key.schema';
 
 // Verify the supplied user-scoped PAK still authenticates against the bucket
 // the fedarisha inbound currently serves on this node. The node resolves
 // bucket / endpoint / region from the live xray runtime config (so admin-side
-// bucket swaps are detected for free) and issues a cheap auth-touching S3
-// call (HeadBucket / ListObjectsV2 with MaxKeys=1) using the supplied creds.
+// bucket swaps are detected for free) and checks PUT/HEAD/DELETE of a probe
+// object inside the user's prefix using the supplied creds.
 //
 // `exists: false` means the request reached S3 but the credentials were
 // rejected (deleted PAK, revoked permissions, prefix wiped). `exists: true`
@@ -16,7 +17,7 @@ export namespace ProbeFedarishaUserCommand {
     export const url = REST_API.FEDARISHA.PROBE_USER;
 
     export const RequestSchema = z.object({
-        userUuid: z.string().uuid(),
+        userUuid: FedarishaUserKeySchema,
         inboundTag: z.string().min(1),
         prefix: z.string().min(1),
         accessKey: z.string().min(1),

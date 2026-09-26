@@ -19,7 +19,7 @@ import { probeS3Credentials } from './s3-probe.helper';
 //        Resource: arn:aws:s3:::<bucket>/<basePrefix>/<userName>/*
 //      This is the ONLY shape Selectel actually honours (see "Selectel
 //      quirks" below). The 20 KB policy size ceiling caps the bucket at
-//      roughly 100–150 active users — same scaling profile as VK Cloud PAK.
+//      fewer than 100 active users once each user also gets a ListBucket rule.
 //
 // Selectel quirks confirmed against vlt-test on s3.ru-1.storage.selcloud.ru
 // (probes in /tmp/sel-policy-probe.mjs and /tmp/sel-principal-probe.mjs):
@@ -50,6 +50,7 @@ const TOKEN_LIFETIME_MS = 23 * 60 * 60 * 1000;
 // path is intentionally outside the user-data namespace (`.fedarisha-…`)
 // to avoid collisions with caller-owned objects.
 const STATE_KEY_PREFIX = '.fedarisha-pak-state';
+const SERVICE_USER_ID_PATTERN = /^(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i;
 // Selectel rejects passwords without upper+lower+digit+special, min 8 chars
 // (REQUEST_VALIDATION_FAILED / invalid_length_password). Service users
 // never log in, but Selectel still demands a strong value at create time.
@@ -65,6 +66,9 @@ export interface ISelectelPakStorage {
     // service-user management goes through the IAM REST API.
     accessKey: string;
     secretKey: string;
+    // IAM ID of the service user that owns accessKey. Its object and bucket
+    // permissions must be retained explicitly once a bucket policy exists.
+    masterServiceUserId: string;
     iam: ISelectelIamConfig;
     basePrefix: string;
     // Selectel rejects virtual-hosted-style on its regional endpoints, so
@@ -130,6 +134,7 @@ export class SelectelPakService implements IPakProvider {
         const keyPrefix = this.keyPrefixFromArgs(storage, prefix);
 
         const token = await this.getIamToken(storage.iam);
+        await this.verifyMasterCredentials(storage, token);
         const serviceUserId = await this.ensureServiceUser(storage.iam, token, userName);
 
         // Grant access BEFORE issuing creds, otherwise the brief window
@@ -170,6 +175,7 @@ export class SelectelPakService implements IPakProvider {
         prefix: string,
     ): Promise<void> {
         const token = await this.getIamToken(storage.iam);
+        await this.verifyMasterCredentials(storage, token);
         const serviceUserId = await this.findServiceUser(storage.iam, token, userName);
         if (!serviceUserId) {
             // Service user is already gone — still scrub the stale policy
@@ -412,6 +418,24 @@ export class SelectelPakService implements IPakProvider {
         return parsed.credentials ?? [];
     }
 
+    private async verifyMasterCredentials(
+        storage: ISelectelPakStorage,
+        token: string,
+    ): Promise<void> {
+        const id = storage.masterServiceUserId;
+        if (!SERVICE_USER_ID_PATTERN.test(id)) {
+            throw new Error(
+                'Selectel: storage.masterServiceUserId must be the IAM ID of the service user that owns storage.accessKey',
+            );
+        }
+        const credentials = await this.listCredentials(storage.iam, token, id);
+        if (!credentials.some((credential) => credential.access_key === storage.accessKey)) {
+            throw new Error(
+                'Selectel: storage.accessKey does not belong to storage.masterServiceUserId',
+            );
+        }
+    }
+
     private async deleteCredentialsByName(
         iam: ISelectelIamConfig,
         token: string,
@@ -485,12 +509,12 @@ export class SelectelPakService implements IPakProvider {
         await this.commitPolicy(storage, { members: next });
     }
 
-    private async commitPolicy(
-        storage: ISelectelPakStorage,
-        state: IPolicyState,
-    ): Promise<void> {
-        await this.writePolicyState(storage, state);
+    private async commitPolicy(storage: ISelectelPakStorage, state: IPolicyState): Promise<void> {
         const policy = this.buildPolicy(storage, state.members);
+        if (Buffer.byteLength(JSON.stringify(policy)) > 20 * 1024) {
+            throw new Error('Selectel: bucket policy exceeds the 20 KB limit');
+        }
+        await this.writePolicyState(storage, state);
         await this.putBucketPolicy(storage, policy);
         this.logger.log(
             `Selectel: bucket policy on ${storage.bucket} now has ${state.members.length} member(s)`,
@@ -498,34 +522,51 @@ export class SelectelPakService implements IPakProvider {
     }
 
     private buildPolicy(storage: ISelectelPakStorage, members: IPolicyMember[]): IBucketPolicy {
-        // Selectel's bucket policy is default-deny FOR ALL principals — once
-        // any policy is attached, even the master S3 keypair loses access to
-        // anything not explicitly allowed. We therefore always include a
-        // statement that grants `*` access to the state-file path so the
-        // next read-modify-write cycle (which runs with master keys) can
-        // still find the state object. The exposure is intentional and
-        // small: the state file contains service-user UUIDs and prefix
-        // labels but no credentials.
-        const statements: IPolicyStatement[] = [this.stateAccessStatement(storage)];
-        if (members.length === 0) {
-            statements.push(this.placeholderStatement(storage));
-        } else {
-            for (const m of members) statements.push(this.buildStatement(storage, m));
+        // An attached Selectel policy denies every principal by default.
+        // Keep the master service user able to list the bucket and read/write
+        // objects under this inbound's prefix and the policy state object.
+        // Never use Principal "*" for user data: that would undo per-user
+        // isolation even if each PAK had its own statement.
+        if (!SERVICE_USER_ID_PATTERN.test(storage.masterServiceUserId)) {
+            throw new Error('Selectel: storage.masterServiceUserId is required');
         }
+        const statements: IPolicyStatement[] = [
+            this.masterListStatement(storage),
+            this.masterObjectStatement(storage),
+            ...members.flatMap((member) => [
+                this.buildObjectStatement(storage, member),
+                this.buildListStatement(storage, member),
+            ]),
+        ];
         return { Version: '2012-10-17', Statement: statements };
     }
 
-    private stateAccessStatement(storage: ISelectelPakStorage): IPolicyStatement {
+    private masterListStatement(storage: ISelectelPakStorage): IPolicyStatement {
         return {
-            Sid: 'fedarisha-pak-state-access',
+            Sid: 'fedarisha-master-list',
             Effect: 'Allow',
-            Principal: { AWS: ['*'] },
-            Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
-            Resource: [`arn:aws:s3:::${storage.bucket}/${STATE_KEY_PREFIX}/*`],
+            Principal: { AWS: [storage.masterServiceUserId] },
+            Action: ['s3:ListBucket'],
+            Resource: [`arn:aws:s3:::${storage.bucket}`],
         };
     }
 
-    private buildStatement(
+    private masterObjectStatement(storage: ISelectelPakStorage): IPolicyStatement {
+        const base = storage.basePrefix.replace(/^\/+|\/+$/g, '');
+        const objectPrefix = base ? `${base}/*` : '*';
+        return {
+            Sid: 'fedarisha-master-objects',
+            Effect: 'Allow',
+            Principal: { AWS: [storage.masterServiceUserId] },
+            Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+            Resource: [
+                `arn:aws:s3:::${storage.bucket}/${objectPrefix}`,
+                `arn:aws:s3:::${storage.bucket}/${STATE_KEY_PREFIX}/*`,
+            ],
+        };
+    }
+
+    private buildObjectStatement(
         storage: ISelectelPakStorage,
         member: IPolicyMember,
     ): IPolicyStatement {
@@ -538,16 +579,21 @@ export class SelectelPakService implements IPakProvider {
         };
     }
 
-    private placeholderStatement(storage: ISelectelPakStorage): IPolicyStatement {
+    private buildListStatement(
+        storage: ISelectelPakStorage,
+        member: IPolicyMember,
+    ): IPolicyStatement {
         return {
-            Sid: 'fedarisha-pak-placeholder',
-            Effect: 'Deny',
-            Principal: { AWS: ['*'] },
-            Action: ['s3:GetObject'],
-            // Path that cannot collide with real prefixes — basePrefix is
-            // user-controlled but `.fedarisha-pak-placeholder` is not a
-            // valid key segment anyone would emit.
-            Resource: [`arn:aws:s3:::${storage.bucket}/.fedarisha-pak-placeholder`],
+            Sid: `list${this.sidFor(member.serviceUserId)}`,
+            Effect: 'Allow',
+            Principal: { AWS: [member.serviceUserId] },
+            Action: ['s3:ListBucket'],
+            Resource: [`arn:aws:s3:::${storage.bucket}`],
+            Condition: {
+                StringLike: {
+                    's3:prefix': [`${member.keyPrefix}/`, `${member.keyPrefix}/*`],
+                },
+            },
         };
     }
 

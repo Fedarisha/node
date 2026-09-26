@@ -21,5 +21,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: node --test test/fedarisha-contract-and-policy.test.cjs
       - run: npm run build
       - run: npm run trace
